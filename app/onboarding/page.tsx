@@ -11,10 +11,39 @@ export default function Onboarding() {
   const [region, setRegion] = useState("Alberta");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   // If the user already has a store, skip onboarding.
   useEffect(() => {
-    getMyProfile().then((p) => { if (p?.store_id) router.replace("/takeoff"); });
+    let cancelled = false;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+    (async () => {
+      try {
+        const p = await getMyProfile();
+        if (cancelled || !p?.store_id) return;
+        router.replace("/takeoff");
+        // Safety net: client-side routing sometimes doesn't actually move
+        // (Next.js caching / race with the auth-profile fetch). If we're still
+        // on /onboarding a second later, force a full navigation. The pathname
+        // guard keeps this from looping once we've left the page.
+        fallbackTimer = setTimeout(() => {
+          if (!cancelled && window.location.pathname.startsWith("/onboarding")) {
+            window.location.assign("/takeoff");
+          }
+        }, 1000);
+      } catch (e) {
+        // If the profile fetch throws, the user would otherwise be stuck on the
+        // form forever. Surface a recoverable error instead.
+        console.error("onboarding: getMyProfile failed", e);
+        if (!cancelled) setLoadFailed(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+    };
   }, [router]);
 
   async function create() {
@@ -22,9 +51,10 @@ export default function Onboarding() {
     setBusy(true); setErr(null);
     try {
       await createStoreAndJoin(name.trim(), region.trim() || undefined);
-      router.push("/takeoff");
-    } catch (e: any) { setErr(e.message ?? "Failed to create store"); }
-    finally { setBusy(false); }
+      // Full page load guarantees a fresh fetch of profile/session and avoids
+      // the client-router occasionally retaining the onboarding route.
+      window.location.assign("/takeoff");
+    } catch (e: any) { setErr(e.message ?? "Failed to create store"); setBusy(false); }
   }
 
   return (
@@ -43,6 +73,14 @@ export default function Onboarding() {
         <label style={lbl}>Region</label>
         <input value={region} onChange={e => setRegion(e.target.value)} style={inp} />
         {err && <div style={{ color: "#C0392B", fontSize: 12.5, marginTop: 10 }}>{err}</div>}
+        {loadFailed && (
+          <div style={{ color: "#C0392B", fontSize: 12.5, marginTop: 10 }}>
+            Couldn't load your profile.{" "}
+            <a href="#" onClick={(e) => { e.preventDefault(); window.location.reload(); }} style={{ color: "#0B1B2B", fontWeight: 600 }}>
+              Reload
+            </a>
+          </div>
+        )}
         <button onClick={create} disabled={busy}
           style={{ width: "100%", marginTop: 18, padding: 12, background: "#0B1B2B", color: "#fff", border: "none", borderRadius: 9, fontWeight: 700, cursor: "pointer" }}>
           {busy ? "Creating…" : "Create store"}
