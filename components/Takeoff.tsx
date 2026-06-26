@@ -41,6 +41,56 @@ const centroid = (pts: Pt[]): Pt => {
 };
 const dist = (a: Pt, b: Pt): number => Math.hypot(a.x - b.x, a.y - b.y);
 
+// ---- PDF → image ----
+// Render the first page of a PDF to an offscreen canvas and hand back both a
+// PNG blob (so the AI-suggest path keeps receiving a real image) and a data URL
+// (used as the <img> source feeding the canvas flow). 100% client-side via
+// pdf.js — no server route.
+// TODO: multi-page support — let the user pick which page to take off. For v1
+// we always render page 1.
+const PDF_TARGET_WIDTH = 2000;   // aim for ~2000px wide for crisp zooming
+const PDF_MAX_DIM = 4000;        // hard cap so giant blueprints don't OOM the browser
+
+async function renderPdfFirstPage(file: File): Promise<{ dataUrl: string; blob: Blob }> {
+  const pdfjs = await import("pdfjs-dist");
+  // Worker is served from public/ (copied from the installed pdfjs-dist by
+  // scripts/copy-pdf-worker.mjs on prebuild/postinstall). Self-hosting keeps the
+  // worker version-locked to the API and avoids the `new URL(...import.meta.url)`
+  // bundling pattern, which breaks `next build` (SWC can't parse the worker's
+  // top-level import.meta).
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+
+  const data = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data }).promise;
+  if (pdf.numPages < 1) throw new Error("This PDF has no pages.");
+
+  const page = await pdf.getPage(1);
+  const base = page.getViewport({ scale: 1 });
+  let scale = PDF_TARGET_WIDTH / base.width;
+  let viewport = page.getViewport({ scale });
+  // clamp so neither dimension blows past the cap (tall site plans, etc.)
+  const longest = Math.max(viewport.width, viewport.height);
+  if (longest > PDF_MAX_DIM) {
+    scale *= PDF_MAX_DIM / longest;
+    viewport = page.getViewport({ scale });
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get a drawing context for the PDF.");
+  ctx.fillStyle = "#fff"; // flatten any transparency to a white sheet
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+
+  const blob: Blob = await new Promise((res, rej) =>
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error("Failed to rasterize the PDF page."))), "image/png")
+  );
+  return { dataUrl: canvas.toDataURL("image/png"), blob };
+}
+
 export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -62,20 +112,47 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);   // rendering a PDF page
 
-  // ---- image upload ----
-  const onUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // ---- shared: mount a loaded <img> into the takeoff flow ----
+  const adoptImage = (im: HTMLImageElement, file: File) => {
     setImgFile(file);
+    setImg(im);
+    setImgDims({ w: im.width, h: im.height });
+    setRooms([]); setDraftPts([]); setScalePts([]); setFtPerPx(null);
+    setMode("scale");
+  };
+
+  // ---- upload: images load directly; PDFs get rasterized via pdf.js first ----
+  const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    setError(null);
+
+    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    if (isPdf) {
+      setPdfBusy(true);
+      try {
+        const { dataUrl, blob } = await renderPdfFirstPage(file);
+        // Hand the AI-suggest path a real PNG instead of the raw PDF bytes.
+        const pngFile = new File([blob], file.name.replace(/\.pdf$/i, "") + ".png", { type: "image/png" });
+        const im = new Image();
+        im.onload = () => { adoptImage(im, pngFile); setPdfBusy(false); };
+        im.onerror = () => { setError("Rendered the PDF but could not load the image."); setPdfBusy(false); };
+        im.src = dataUrl;
+      } catch (err: any) {
+        setError(err?.message ? `Couldn't open that PDF: ${err.message}` : "Couldn't open that PDF. Is it a valid file?");
+        setPdfBusy(false);
+      }
+      return;
+    }
+
+    // images: original path
     const url = URL.createObjectURL(file);
     const im = new Image();
-    im.onload = () => {
-      setImg(im);
-      setImgDims({ w: im.width, h: im.height });
-      setRooms([]); setDraftPts([]); setScalePts([]); setFtPerPx(null);
-      setMode("scale");
-    };
+    im.onload = () => adoptImage(im, file);
+    im.onerror = () => setError("Couldn't load that image file.");
     im.src = url;
   };
 
@@ -265,7 +342,7 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
         <div style={{ background: "#fff", borderRight: `1px solid #E2E8F0`, padding: 16, overflowY: "auto" }}>
           <label style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "center", padding: "10px 12px", background: C.bg, color: "#fff", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600 }}>
             <Upload size={16} /> Upload plan
-            <input type="file" accept="image/*" onChange={onUpload} style={{ display: "none" }} />
+            <input type="file" accept="image/*,application/pdf" onChange={onUpload} style={{ display: "none" }} />
           </label>
 
           <div style={{ marginTop: 18, fontSize: 12, fontWeight: 700, color: C.soft, textTransform: "uppercase", letterSpacing: 0.6 }}>Tools</div>
@@ -306,20 +383,33 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
         </div>
 
         {/* CENTER: canvas */}
-        <div ref={wrapRef} style={{ background: "#1A2A3A", display: "flex", alignItems: "center", justifyContent: "center", overflow: "auto", padding: 16 }}>
-          {!img ? (
+        <div ref={wrapRef} style={{ background: "#1A2A3A", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", overflow: "auto", padding: 16 }}>
+          {pdfBusy && !img ? (
+            <div style={{ color: "#7C93A8", textAlign: "center" }}>
+              <Loader2 size={40} className="spin" style={{ opacity: 0.7 }} />
+              <div style={{ marginTop: 10 }}>Rendering page 1 of PDF…</div>
+            </div>
+          ) : !img ? (
             <div style={{ color: "#7C93A8", textAlign: "center" }}>
               <FileText size={40} style={{ opacity: 0.5 }} />
               <div style={{ marginTop: 10 }}>Upload a blueprint to begin.</div>
+              {error && <div style={{ marginTop: 10, color: "#E4572E", fontSize: 13, maxWidth: 320 }}>{error}</div>}
             </div>
           ) : (
-            <canvas
-              ref={canvasRef}
-              width={imgDims.w}
-              height={imgDims.h}
-              onClick={onCanvasClick}
-              style={{ maxWidth: "100%", maxHeight: "100%", background: "#fff", cursor: mode === "idle" ? "default" : "crosshair", boxShadow: "0 8px 30px rgba(0,0,0,0.4)" }}
-            />
+            <>
+              <canvas
+                ref={canvasRef}
+                width={imgDims.w}
+                height={imgDims.h}
+                onClick={onCanvasClick}
+                style={{ maxWidth: "100%", maxHeight: "100%", background: "#fff", cursor: mode === "idle" ? "default" : "crosshair", boxShadow: "0 8px 30px rgba(0,0,0,0.4)" }}
+              />
+              {pdfBusy && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, background: "rgba(11,27,43,0.55)", color: "#fff", fontSize: 14 }}>
+                  <Loader2 size={28} className="spin" /> Rendering page 1 of PDF…
+                </div>
+              )}
+            </>
           )}
         </div>
 
