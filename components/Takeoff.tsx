@@ -332,7 +332,7 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
         fr.onerror = () => rej(new Error("Could not read image"));
         fr.readAsDataURL(imgFile);
       });
-      const detected = await detectRooms(base64, imgFile.type || "image/jpeg", imgDims.w, imgDims.h);
+      const detected = await detectRooms(base64, imgFile.type || "image/jpeg", imgDims.w, imgDims.h, ftPerPx);
       if (detected.length === 0) {
         setError("No rooms detected. Try drawing them manually.");
       } else {

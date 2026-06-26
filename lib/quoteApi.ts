@@ -149,7 +149,7 @@ export async function addWasteRule(storeId: string, category: WasteRule["categor
 export interface DetectedRoom { label: string; points: { x: number; y: number }[]; }
 
 export async function detectRooms(
-  imageBase64: string, mediaType: string, width: number, height: number
+  imageBase64: string, mediaType: string, width: number, height: number, ftPerPx?: number | null
 ): Promise<DetectedRoom[]> {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session) throw new Error("Not signed in.");
@@ -157,7 +157,7 @@ export async function detectRooms(
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` },
-    body: JSON.stringify({ image_base64: imageBase64, media_type: mediaType, image_width: width, image_height: height }),
+    body: JSON.stringify({ image_base64: imageBase64, media_type: mediaType, image_width: width, image_height: height, ft_per_px: ftPerPx ?? null }),
   });
   const body = await res.json();
   if (!res.ok) {

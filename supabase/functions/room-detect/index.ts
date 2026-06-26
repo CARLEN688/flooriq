@@ -1,8 +1,10 @@
 // FloorIQ room-detect edge function
-// Takes a blueprint image and asks Claude (vision) to propose room polygons.
-// Returns candidate rooms in PIXEL coordinates so the canvas can render them
-// directly for the estimator to confirm/adjust. The model proposes; the human
-// disposes (areas are recomputed client-side from the confirmed polygons).
+// Takes a blueprint image (and, if known, the drawing scale) and asks Claude
+// (vision, with deliberate reasoning) to trace each floored area as a polygon
+// that follows the interior wall faces. Returns candidate rooms in PIXEL
+// coordinates so the canvas can render them directly for the estimator to
+// confirm/adjust. The model proposes; the human disposes (areas are recomputed
+// client-side from the confirmed polygons).
 //
 // Requires the ANTHROPIC_API_KEY secret:
 //   Supabase dashboard -> Project Settings -> Edge Functions -> Secrets
@@ -13,7 +15,8 @@
 //   "image_base64": "<data without the data: prefix>",
 //   "media_type": "image/png" | "image/jpeg",
 //   "image_width": 2000,    // natural px width the coords should map to
-//   "image_height": 1400
+//   "image_height": 1400,
+//   "ft_per_px": 0.0452     // optional: feet per pixel (from the Set-scale tool)
 // }
 //
 // Response: { ok, rooms: [{ label, points: [{x,y}, ...] }] }
@@ -38,6 +41,7 @@ interface DetectReq {
   media_type?: string;
   image_width: number;
   image_height: number;
+  ft_per_px?: number | null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -69,22 +73,45 @@ Deno.serve(async (req: Request) => {
   const W = Math.round(body.image_width);
   const H = Math.round(body.image_height);
 
+  // If the estimator has set the scale, give the model pixels-per-foot so it can
+  // turn the plan's printed room dimensions into accurate pixel sizes.
+  const pxPerFt = body.ft_per_px && body.ft_per_px > 0 ? 1 / body.ft_per_px : null;
+  const scaleLine = pxPerFt
+    ? `The drawing scale is approximately ${pxPerFt.toFixed(2)} pixels per foot. Many rooms have ` +
+      "their dimensions printed on the plan (e.g. \"12'10\\\"x12'\", \"10'4\\\"x9'6\\\"\"). Use those " +
+      "printed dimensions together with this scale to size each room's polygon accurately in pixels. "
+    : "Many rooms have their dimensions printed on the plan; use them to keep proportions accurate. ";
+
   const system =
-    "You are a flooring takeoff assistant. You receive an architectural floor plan image. " +
-    "Identify each distinct enclosed room or floor area. For each, return a simple closed " +
-    "polygon (4-8 points is plenty; trace the room's interior walls) and a short room label " +
-    "such as 'Bedroom', 'Bath', 'Kitchen', 'Hall', 'Living', 'Closet'. " +
-    `Coordinates MUST be in pixels for an image that is exactly ${W} wide and ${H} tall, ` +
-    "origin at the top-left, x increasing to the right, y increasing downward. " +
-    "Only include actual interior rooms/areas that would get flooring — skip the title " +
-    "block, dimension lines, and text outside the building footprint. " +
-    "Respond with ONLY a JSON object — no prose, no explanation, no markdown code fences — " +
-    'of the exact form: {"rooms":[{"label":"Bedroom","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":80},{"x":0,"y":80}]}]}. ' +
+    "You are an expert flooring-takeoff estimator analyzing an architectural floor plan image. " +
+    "Your job is to trace each distinct floored area as a polygon whose vertices follow the INTERIOR " +
+    "faces of that room's walls, so the enclosed area matches the real room as closely as possible.\n\n" +
+    "Rules:\n" +
+    "- Identify every enclosed interior space that receives flooring: bedrooms, living, dining, kitchen, " +
+    "bathrooms, halls, closets, laundry, pantries, mechanical rooms, entries, stairs landings, etc. Read the " +
+    "printed room name for the label. Skip the title block, the legend/notes, exterior dimension strings, the " +
+    "north arrow, and anything outside the building footprint.\n" +
+    "- Trace TIGHT to the walls. For a rectangular room return its 4 corners at the inside wall faces. For an " +
+    "L-shaped or irregular room add the extra corners needed (typically 6-12 points) so the outline hugs the " +
+    "walls. Never return a loose bounding box that bleeds across a wall into the next room.\n" +
+    "- Adjacent rooms share a wall, so their polygons must NOT overlap. Put each room's boundary at the inside " +
+    "face of the dividing wall, leaving the wall thickness between two neighboring rooms.\n" +
+    "- Follow the actual drawn wall lines, not the dimension/annotation lines. Doorway openings can be treated " +
+    "as part of the wall line (close across them).\n" +
+    scaleLine +
+    `- Coordinates are pixels for an image that is exactly ${W} wide and ${H} tall, origin at the top-left, ` +
+    `x increasing right, y increasing down. Keep every point within 0..${W} (x) and 0..${H} (y).\n\n` +
+    "Think step by step about where each wall sits, then output. Respond with ONLY a JSON object — no prose, " +
+    "no explanation, no markdown code fences — of the exact form: " +
+    '{"rooms":[{"label":"Bedroom","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":80},{"x":0,"y":80}]}]}. ' +
     'If you cannot identify any rooms confidently, return {"rooms":[]}.';
 
   const payload = {
     model: "claude-opus-4-8",
-    max_tokens: 8000,
+    max_tokens: 16000,
+    // Deliberate reasoning meaningfully improves spatial accuracy on dense plans.
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high" },
     system,
     messages: [
       {
@@ -94,7 +121,7 @@ Deno.serve(async (req: Request) => {
             type: "image",
             source: { type: "base64", media_type: mediaType, data: body.image_base64 },
           },
-          { type: "text", text: "Detect the rooms in this floor plan and return the JSON." },
+          { type: "text", text: "Trace the rooms in this floor plan and return the JSON." },
         ],
       },
     ],
@@ -127,13 +154,13 @@ Deno.serve(async (req: Request) => {
     return json({ error: "The model declined to analyze this image. Try drawing rooms manually." }, 502);
   }
 
-  // Claude returns the answer as a JSON text block. Be defensive about stray
-  // prose or markdown fences before parsing.
-  const textBlock = Array.isArray(data?.content)
-    ? data.content.find((b: any) => b?.type === "text")
-    : null;
-  let raw = (textBlock?.text ?? "{}").trim();
-  const fence = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  // The answer is JSON in one or more text blocks (thinking blocks are separate).
+  // Join all text, then defensively strip prose/fences before parsing.
+  const textBlocks = Array.isArray(data?.content)
+    ? data.content.filter((b: any) => b?.type === "text").map((b: any) => b.text ?? "")
+    : [];
+  let raw = textBlocks.join("\n").trim();
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fence) raw = fence[1].trim();
   if (!raw.startsWith("{")) {
     const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
