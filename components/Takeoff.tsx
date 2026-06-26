@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
-import { Upload, Ruler, Pencil, Sparkles, Trash2, Check, X, Plus, Square, FileText, LogOut, Loader2 } from "lucide-react";
+import { Upload, Ruler, Pencil, Sparkles, Trash2, Check, X, Plus, Square, FileText, LogOut, Loader2, ChevronLeft, ChevronRight } from "lucide-react";
 import { generateQuote, detectRooms } from "../lib/quoteApi";
 import { supabase } from "../lib/supabaseClient";
 
@@ -42,16 +42,15 @@ const centroid = (pts: Pt[]): Pt => {
 const dist = (a: Pt, b: Pt): number => Math.hypot(a.x - b.x, a.y - b.y);
 
 // ---- PDF → image ----
-// Render the first page of a PDF to an offscreen canvas and hand back both a
-// PNG blob (so the AI-suggest path keeps receiving a real image) and a data URL
-// (used as the <img> source feeding the canvas flow). 100% client-side via
-// pdf.js — no server route.
-// TODO: multi-page support — let the user pick which page to take off. For v1
-// we always render page 1.
+// Multi-page aware: load the document once, then rasterize whichever page the
+// user is viewing into an offscreen canvas. Each call hands back a PNG blob (so
+// the AI-suggest path keeps receiving a real image) and a data URL (used as the
+// <img> source feeding the canvas flow). 100% client-side via pdf.js — no
+// server route. Per-page takeoff state is kept in the component (pageStateRef).
 const PDF_TARGET_WIDTH = 2000;   // aim for ~2000px wide for crisp zooming
 const PDF_MAX_DIM = 4000;        // hard cap so giant blueprints don't OOM the browser
 
-async function renderPdfFirstPage(file: File): Promise<{ dataUrl: string; blob: Blob }> {
+async function loadPdf(file: File) {
   const pdfjs = await import("pdfjs-dist");
   // Worker is served from public/ (copied from the installed pdfjs-dist by
   // scripts/copy-pdf-worker.mjs on prebuild/postinstall). Self-hosting keeps the
@@ -63,8 +62,11 @@ async function renderPdfFirstPage(file: File): Promise<{ dataUrl: string; blob: 
   const data = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data }).promise;
   if (pdf.numPages < 1) throw new Error("This PDF has no pages.");
+  return pdf;
+}
 
-  const page = await pdf.getPage(1);
+async function renderPdfPage(pdf: any, pageNum: number): Promise<{ dataUrl: string; blob: Blob }> {
+  const page = await pdf.getPage(pageNum);
   const base = page.getViewport({ scale: 1 });
   let scale = PDF_TARGET_WIDTH / base.width;
   let viewport = page.getViewport({ scale });
@@ -114,13 +116,64 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);   // rendering a PDF page
 
-  // ---- shared: mount a loaded <img> into the takeoff flow ----
-  const adoptImage = (im: HTMLImageElement, file: File) => {
+  // ---- multi-page PDF session ----
+  const pdfDocRef = useRef<any>(null);             // the loaded PDFDocumentProxy
+  // per-page takeoff state, so flipping pages doesn't lose work
+  const pageStateRef = useRef<Map<number, { rooms: Room[]; scalePts: Pt[]; ftPerPx: number | null; refFeet: number }>>(new Map());
+  const [pdfName, setPdfName] = useState("");
+  const [pdfPage, setPdfPage] = useState(0);       // 1-based current page; 0 when not a PDF
+  const [pdfPageCount, setPdfPageCount] = useState(0);
+  const [pdfRenderingPage, setPdfRenderingPage] = useState(1);  // page shown in the loading state
+
+  // ---- shared image mounting ----
+  const setImageOnly = (im: HTMLImageElement, file: File) => {
     setImgFile(file);
     setImg(im);
     setImgDims({ w: im.width, h: im.height });
+  };
+  const resetTakeoffState = () => {
     setRooms([]); setDraftPts([]); setScalePts([]); setFtPerPx(null);
     setMode("scale");
+  };
+
+  // Rasterize a PDF page and mount it, restoring that page's saved takeoff (or a
+  // clean slate on first visit). Each page is an independent takeoff.
+  const showPdfPage = (pdf: any, n: number, name: string) => {
+    setPdfRenderingPage(n);
+    renderPdfPage(pdf, n).then(({ dataUrl, blob }) => {
+      // Hand the AI-suggest path a real PNG instead of raw PDF bytes.
+      const stem = name.replace(/\.pdf$/i, "");
+      const pngFile = new File([blob], `${stem}-p${n}.png`, { type: "image/png" });
+      const im = new Image();
+      im.onload = () => {
+        setImageOnly(im, pngFile);
+        const saved = pageStateRef.current.get(n);
+        if (saved) {
+          setRooms(saved.rooms); setScalePts(saved.scalePts);
+          setFtPerPx(saved.ftPerPx); setRefFeet(saved.refFeet);
+          setDraftPts([]); setMode(saved.ftPerPx ? "idle" : "scale");
+        } else {
+          resetTakeoffState();
+        }
+        setPdfPage(n);
+        setPdfBusy(false);
+      };
+      im.onerror = () => { setError("Rendered the PDF but could not load the page image."); setPdfBusy(false); };
+      im.src = dataUrl;
+    }).catch((err: any) => {
+      setError(err?.message ? `Couldn't render that page: ${err.message}` : "Couldn't render that PDF page.");
+      setPdfBusy(false);
+    });
+  };
+
+  // Flip to another page, stashing the current page's work first.
+  const goToPage = (n: number) => {
+    const pdf = pdfDocRef.current;
+    if (!pdf || pdfBusy || n < 1 || n > pdfPageCount || n === pdfPage) return;
+    setError(null);
+    pageStateRef.current.set(pdfPage, { rooms, scalePts, ftPerPx, refFeet });
+    setPdfBusy(true);
+    showPdfPage(pdf, n, pdfName);
   };
 
   // ---- upload: images load directly; PDFs get rasterized via pdf.js first ----
@@ -134,13 +187,14 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
     if (isPdf) {
       setPdfBusy(true);
       try {
-        const { dataUrl, blob } = await renderPdfFirstPage(file);
-        // Hand the AI-suggest path a real PNG instead of the raw PDF bytes.
-        const pngFile = new File([blob], file.name.replace(/\.pdf$/i, "") + ".png", { type: "image/png" });
-        const im = new Image();
-        im.onload = () => { adoptImage(im, pngFile); setPdfBusy(false); };
-        im.onerror = () => { setError("Rendered the PDF but could not load the image."); setPdfBusy(false); };
-        im.src = dataUrl;
+        pdfDocRef.current?.destroy?.();
+        const pdf = await loadPdf(file);
+        pdfDocRef.current = pdf;
+        pageStateRef.current.clear();
+        setPdfName(file.name);
+        setPdfPageCount(pdf.numPages);
+        setPdfPage(0);
+        showPdfPage(pdf, 1, file.name);  // clears pdfBusy when the page is ready
       } catch (err: any) {
         setError(err?.message ? `Couldn't open that PDF: ${err.message}` : "Couldn't open that PDF. Is it a valid file?");
         setPdfBusy(false);
@@ -148,10 +202,14 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
       return;
     }
 
-    // images: original path
+    // images: tear down any PDF session, then use the original path
+    pdfDocRef.current?.destroy?.();
+    pdfDocRef.current = null;
+    pageStateRef.current.clear();
+    setPdfPageCount(0); setPdfPage(0); setPdfName("");
     const url = URL.createObjectURL(file);
     const im = new Image();
-    im.onload = () => adoptImage(im, file);
+    im.onload = () => { setImageOnly(im, file); resetTakeoffState(); };
     im.onerror = () => setError("Couldn't load that image file.");
     im.src = url;
   };
@@ -384,10 +442,22 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
 
         {/* CENTER: canvas */}
         <div ref={wrapRef} style={{ background: "#1A2A3A", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", overflow: "auto", padding: 16 }}>
+          {/* multi-page PDF navigator */}
+          {pdfPageCount > 1 && pdfPage >= 1 && (
+            <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 5, display: "flex", alignItems: "center", gap: 6, background: "#11263B", color: "#fff", border: "1px solid #1E3A52", padding: "5px 8px", borderRadius: 9, fontSize: 13, boxShadow: "0 4px 14px rgba(0,0,0,0.35)" }}>
+              <button title="Previous page" onClick={() => goToPage(pdfPage - 1)} disabled={pdfPage <= 1 || pdfBusy} style={pageNavBtn(pdfPage <= 1 || pdfBusy)}>
+                <ChevronLeft size={16} />
+              </button>
+              <span title="Each page keeps its own rooms & scale" style={{ minWidth: 78, textAlign: "center" }}>Page {pdfPage} / {pdfPageCount}</span>
+              <button title="Next page" onClick={() => goToPage(pdfPage + 1)} disabled={pdfPage >= pdfPageCount || pdfBusy} style={pageNavBtn(pdfPage >= pdfPageCount || pdfBusy)}>
+                <ChevronRight size={16} />
+              </button>
+            </div>
+          )}
           {pdfBusy && !img ? (
             <div style={{ color: "#7C93A8", textAlign: "center" }}>
               <Loader2 size={40} className="spin" style={{ opacity: 0.7 }} />
-              <div style={{ marginTop: 10 }}>Rendering page 1 of PDF…</div>
+              <div style={{ marginTop: 10 }}>Rendering page {pdfRenderingPage} of PDF…</div>
             </div>
           ) : !img ? (
             <div style={{ color: "#7C93A8", textAlign: "center" }}>
@@ -406,7 +476,7 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
               />
               {pdfBusy && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, background: "rgba(11,27,43,0.55)", color: "#fff", fontSize: 14 }}>
-                  <Loader2 size={28} className="spin" /> Rendering page 1 of PDF…
+                  <Loader2 size={28} className="spin" /> Rendering page {pdfRenderingPage} of PDF…
                 </div>
               )}
             </>
@@ -495,6 +565,16 @@ export default function FloorIQTakeoff({ jobId }: { jobId: string }) {
       <style>{`.spin{animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
+}
+
+function pageNavBtn(disabled: boolean): React.CSSProperties {
+  return {
+    display: "flex", alignItems: "center", justifyContent: "center", width: 26, height: 24,
+    borderRadius: 6, border: "1px solid #2A3F55",
+    background: disabled ? "#0E2032" : "#1B3650",
+    color: disabled ? "#5E7488" : "#fff",
+    cursor: disabled ? "not-allowed" : "pointer",
+  };
 }
 
 function ToolBtn({ icon, label, active, onClick, disabled }: {
