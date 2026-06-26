@@ -162,7 +162,7 @@ export async function detectRooms(
   const body = await res.json();
   if (!res.ok) {
     const msg = body?.code === "no_api_key"
-      ? "AI detection isn't configured yet (add the OpenAI key). Drawing rooms manually still works."
+      ? "AI detection isn't configured yet (add the ANTHROPIC_API_KEY secret). Drawing rooms manually still works."
       : (body?.error ?? `Detection failed (${res.status})`);
     throw new Error(msg);
   }
