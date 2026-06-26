@@ -40,36 +40,6 @@ interface DetectReq {
   image_height: number;
 }
 
-// Structured-output schema: forces Claude to return exactly this shape so we
-// never have to parse loose prose or markdown fences.
-const ROOM_SCHEMA = {
-  type: "object",
-  properties: {
-    rooms: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          label: { type: "string" },
-          points: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: { x: { type: "number" }, y: { type: "number" } },
-              required: ["x", "y"],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ["label", "points"],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ["rooms"],
-  additionalProperties: false,
-};
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
@@ -108,7 +78,9 @@ Deno.serve(async (req: Request) => {
     "origin at the top-left, x increasing to the right, y increasing downward. " +
     "Only include actual interior rooms/areas that would get flooring — skip the title " +
     "block, dimension lines, and text outside the building footprint. " +
-    "If you cannot identify any rooms confidently, return an empty rooms array.";
+    "Respond with ONLY a JSON object — no prose, no explanation, no markdown code fences — " +
+    'of the exact form: {"rooms":[{"label":"Bedroom","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":80},{"x":0,"y":80}]}]}. ' +
+    'If you cannot identify any rooms confidently, return {"rooms":[]}.';
 
   const payload = {
     model: "claude-opus-4-8",
@@ -122,11 +94,10 @@ Deno.serve(async (req: Request) => {
             type: "image",
             source: { type: "base64", media_type: mediaType, data: body.image_base64 },
           },
-          { type: "text", text: "Detect the rooms in this floor plan." },
+          { type: "text", text: "Detect the rooms in this floor plan and return the JSON." },
         ],
       },
     ],
-    output_config: { format: { type: "json_schema", schema: ROOM_SCHEMA } },
   };
 
   let aiResp: Response;
@@ -146,7 +117,8 @@ Deno.serve(async (req: Request) => {
 
   if (!aiResp.ok) {
     const t = await aiResp.text();
-    return json({ error: "Vision API error", status: aiResp.status, detail: t.slice(0, 500) }, 502);
+    // Surface Anthropic's actual message so the UI shows the real cause.
+    return json({ error: `Vision API error (${aiResp.status}): ${t.slice(0, 300)}`, code: "vision_error" }, 502);
   }
 
   const data = await aiResp.json();
@@ -155,11 +127,18 @@ Deno.serve(async (req: Request) => {
     return json({ error: "The model declined to analyze this image. Try drawing rooms manually." }, 502);
   }
 
-  // With structured outputs the answer is a single JSON text block.
+  // Claude returns the answer as a JSON text block. Be defensive about stray
+  // prose or markdown fences before parsing.
   const textBlock = Array.isArray(data?.content)
     ? data.content.find((b: any) => b?.type === "text")
     : null;
-  const raw = textBlock?.text ?? "{}";
+  let raw = (textBlock?.text ?? "{}").trim();
+  const fence = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) raw = fence[1].trim();
+  if (!raw.startsWith("{")) {
+    const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+    if (s >= 0 && e > s) raw = raw.slice(s, e + 1);
+  }
 
   let parsed: { rooms?: Array<{ label?: string; points?: Array<{ x: number; y: number }> }> };
   try { parsed = JSON.parse(raw); }
